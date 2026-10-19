@@ -274,6 +274,76 @@ async function openDb(mainBuf, walBuf){
 /* =========================================================
    STEP 3 — QUERY AND BUILD TASK OBJECTS (mirrors export_flat)
    ========================================================= */
+/* ---------- code & screens (counted from write/insert/diff/replace tool calls) ---------- */
+const CODE_EXT=new Set("js jsx ts tsx mjs cjs py css scss sass less html vue svelte java kt cs go rs rb php sql sh ps1 bat c cpp h dart swift xaml".split(" "));
+const SCR_EXT=new Set("jsx tsx vue svelte html xaml dart kt swift".split(" "));
+const SCR_DIR=/(^|\/)(pages?|screens?|views?|routes?|templates)\//i;
+const SCR_NAME=/(Screen|Page|View)\.(jsx|tsx|vue|svelte|dart|xaml|kt|swift)$/;
+const _pj=s=>{try{return JSON.parse(s)||{};}catch(_){return {};}};
+const extOf=p=>{const b=String(p||"").replace(/\\/g,"/").split("/").pop().toLowerCase(); const i=b.lastIndexOf("."); return i>0?b.slice(i+1):"";};
+function isScreen(p){
+  p=String(p||"").replace(/\\/g,"/"); const b=p.split("/").pop(), e=extOf(p);
+  if(/\.(test|spec|stories)\./i.test(b)||/\.module\.css$/i.test(b)||/^index\.html?$/i.test(b)||!SCR_EXT.has(e)) return false;
+  return SCR_DIR.test(p)||SCR_NAME.test(b)||e==="html";
+}
+const nLines=s=>{ if(!s) return 0; const a=String(s).split(/\r?\n/); if(a[a.length-1]==="") a.pop(); return a.length; };
+function diffCounts(d){
+  let add=0,del=0; const rx=/<<<<<<< SEARCH\n([\s\S]*?)\n=======\n([\s\S]*?)\n?>>>>>>> REPLACE/g; let m;
+  while((m=rx.exec(d||""))){ del+=nLines(m[1].replace(/^:start_line:\d+\n-------\n/,"")); add+=nLines(m[2]); }
+  return [add,del];
+}
+/* returns only a path and line counts, never file content */
+function codeOp(name,a){
+  if(typeof a==="string") a=_pj(a); a=a||{};
+  const path=a.path; if(!path) return null; let add=0,del=0;
+  if(name==="write_file") add=nLines(a.content)||parseInt(a.line_count)||0; /* real content; line_count is the model\u2019s own estimate and runs low */
+  else if(name==="insert_content") add=nLines(a.content);
+  else if(name==="apply_diff") [add,del]=diffCounts(a.diff);
+  else if(name==="search_and_replace"){ add=nLines(a.replace); del=nLines(a.search); }
+  else return null;
+  return {op:name,path:String(path).replace(/\\/g,"/"),add,del};
+}
+function codeStats(T){
+  const P=new Map(), cost={}, first=new Map();
+  T.forEach(t=>{ cost[t.project]=(cost[t.project]||0)+t.cost;
+    (t.code||[]).forEach(o=>{
+      const fk=t.project+"\u0000"+o.path, f0=first.get(fk), ot=+o.t||0;
+      if(!f0||ot<f0.t) first.set(fk,{t:ot,op:o.op});
+      let p=P.get(t.project); if(!p) P.set(t.project,p={project:t.project,files:new Set(),add:0,del:0,cAdd:0,cDel:0,screens:new Set(),ext:{}});
+      p.files.add(o.path); p.add+=o.add; p.del+=o.del;
+      const e=extOf(o.path);
+      if(CODE_EXT.has(e)){ p.cAdd+=o.add; p.cDel+=o.del; p.ext[e]=(p.ext[e]||0)+o.add; }
+      if(isScreen(o.path)) p.screens.add(o.path);
+    }); });
+  const list=[...P.values()].map(p=>({project:p.project,files:p.files.size,add:p.add,del:p.del,cAdd:p.cAdd,cDel:p.cDel,net:p.cAdd-p.cDel,
+    screens:[...p.screens].sort(),made:new Set([...p.screens].filter(s=>(first.get(p.project+"\u0000"+s)||{}).op==="write_file")),
+    ext:p.ext,cost:cost[p.project]||0})).sort((a,b)=>b.cAdd-a.cAdd);
+  list.forEach(p=>{ p.screensNew=p.made.size; });
+  const sum=f=>list.reduce((a,p)=>a+f(p),0);
+  return {list,files:sum(p=>p.files),cAdd:sum(p=>p.cAdd),cDel:sum(p=>p.cDel),net:sum(p=>p.net),screens:sum(p=>p.screens.length),screensNew:sum(p=>p.screensNew)};
+}
+function codeSection(C){
+  if(!C.list.length) return "";
+  const n=v=>v.toLocaleString();
+  const langs=C.list.map(p=>{const e=Object.entries(p.ext).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([x,v])=>`${x} ${v>=1000?(v/1000).toFixed(1)+"k":v}`).join(", ");
+    return e?`${esc(p.project)}: ${e}`:"";}).filter(Boolean).join(" · ");
+  const shown=C.list.filter(p=>p.screens.length);
+  return `<section class="panel">
+    <h2>What was built: code and screens</h2>
+    <p class="sub">Counted from the files Bob wrote or edited. Only file paths and line counts are used; no code is read into this report.</p>
+    <p style="font-size:18px;font-weight:500;margin:12px 0">Bob wrote <b>${n(C.cAdd)}</b> lines of code (<b>${n(C.net)}</b> net after removals) across <b>${n(C.files)}</b> files, and created <b>${n(C.screensNew)}</b> screen${C.screensNew===1?"":"s"}${C.screens>C.screensNew?`, plus edited ${n(C.screens-C.screensNew)} existing`:""}.</p>
+    <div class="scroll"><table>
+      <thead><tr><th>Project</th><th>Files</th><th>Lines written</th><th>Removed</th><th>Net</th><th>Screens</th><th>Coins</th><th>Coins / 1k lines</th><th>Coins / screen</th></tr></thead>
+      <tbody>${C.list.map(p=>`<tr><td>${esc(p.project)}</td><td>${p.files}</td><td>${n(p.cAdd)}</td><td>${n(p.cDel)}</td><td>${n(p.net)}</td><td>${p.screensNew}${p.screens.length>p.screensNew?`<span class="foot"> +${p.screens.length-p.screensNew} edited</span>`:""}</td><td>${c1(p.cost)}</td><td>${p.cAdd?c2(p.cost/p.cAdd*1000):"–"}</td><td>${p.screensNew?c2(p.cost/p.screensNew):"–"}</td></tr>`).join("")}</tbody>
+    </table></div>
+    ${langs?`<p class="cap">Lines written by language: ${langs}.</p>`:""}
+    ${shown.length?`<details style="margin-top:10px"><summary style="cursor:pointer;color:var(--accent);font-size:13px">Show the ${n(C.screens)} screens</summary>
+      ${shown.map(p=>`<p class="cap" style="margin-top:8px"><b>${esc(p.project)}</b></p><ul style="margin:4px 0 0;padding-left:20px;font-size:13px;color:var(--ink2)">${p.screens.map(s=>`<li>${esc(s)}${p.made.has(s)?"":` <span class="foot">(edited)</span>`}</li>`).join("")}</ul>`).join("")}</details>`:""}
+    <p class="cap">A screen is a page, view or screen file (for example <code>src/pages/Menu.jsx</code>, <code>src/views/Dashboard.vue</code> or an .html page). Components, styles and tests are not counted. "Created" means the first action Bob took on the file was writing it whole. Lines are counted from the content Bob sent, not from the line count it reports. Lines of code exclude docs and config such as .md and .json. Lines written is gross, so a rewritten file counts again; net subtracts removed lines. Treat both as estimates.</p>
+  </section>`;
+}
+/* ---------- end code ---------- */
+
 function exportFlat(db){
   const tasks = {};
 
@@ -305,6 +375,7 @@ function exportFlat(db){
       commands: [],
       compactions: [],
       files: [],
+      code: [],
       _envMode: env.modeId||"",
     };
   }
@@ -340,6 +411,7 @@ function exportFlat(db){
         for(const c of toolCalls){
           const n = c.name||"?";
           names.push(n);
+          { const co=codeOp(n,c.arguments); if(co) t.code.push({t:meta.timestamp||created_at,...co}); }
           if(n==="execute_command"){
             t.commands.push({
               t:    meta.timestamp||created_at,
@@ -735,6 +807,8 @@ function render(){
     <p class="cap">Bars turn orange once the request is above the threshold. A steady climb in the context line means the conversation was never reset.</p>
   </section>`:""}
 
+  ${codeSection(codeStats(A.T))}
+
   <section>
     <h2>What the data says</h2>
     <p class="sub" style="margin-bottom:12px">Ranked by likely effect. Open a finding for the evidence and what to try. Estimates marked ~ are not additive; findings overlap.</p>
@@ -869,6 +943,26 @@ function exportPpt(A, F, plan, alloc, thr){
       {text:"Per request",options:{bold:true,color:GRAY,fontSize:9,align:"right"}},
       {text:"Avg context",options:{bold:true,color:GRAY,fontSize:9,align:"right"}},
     ],...rows],{x:0.4,y:1.0,w:12.1,colW:[3.5,2,2,2.3,2.3],fontSize:11,border:{pt:0.5,color:"E1E4E9"},fontFace:"Calibri"});
+  }
+
+  // Slide — What was built (code and screens)
+  {
+    const CS=codeStats(A.T);
+    if(CS.list.length){
+      const sl=pptx.addSlide();
+      addTitle(sl,"What was built: code and screens");
+      addSub(sl,`${CS.cAdd.toLocaleString()} lines of code written (${CS.net.toLocaleString()} net) across ${CS.files} files · ${CS.screensNew} screen${CS.screensNew===1?"":"s"} created${CS.screens>CS.screensNew?` (+${CS.screens-CS.screensNew} edited)`:""}`);
+      const hd=["Project","Files","Lines","Net","Screens","Coins","Coins / 1k lines","Coins / screen"].map((t,i)=>({text:t,options:{bold:true,color:GRAY,fontSize:9,align:i?"right":"left"}}));
+      const rows=CS.list.slice(0,10).map(p=>[p.project.slice(0,26),p.files,p.cAdd.toLocaleString(),p.net.toLocaleString(),p.screensNew,c1(p.cost),p.cAdd?c2(p.cost/p.cAdd*1000):"–",p.screensNew?c2(p.cost/p.screensNew):"–"]
+        .map((t,i)=>({text:String(t),options:{color:DARK,align:i?"right":"left"}})));
+      sl.addTable([hd,...rows],{x:0.4,y:1.3,w:12.1,colW:[3.2,0.9,1.3,1.3,1,1.2,1.7,1.5],fontSize:11,border:{pt:0.5,color:"E1E4E9"},fontFace:"Calibri"});
+      sl.addText("Lines of code exclude docs and config (.md, .json). Lines written is gross; net subtracts removed lines. Screens are page, view or screen files. Estimates.",{x:0.4,y:6.6,w:12,h:0.4,fontSize:10,color:GRAY,fontFace:"Calibri",italic:true});
+      if(CS.screens){
+        const items=CS.list.flatMap(p=>p.screens.map(x=>`${p.project.slice(0,18)}: ${x}${p.made.has(x)?"":" (edited)"}`)).slice(0,36), half=Math.ceil(items.length/2);
+        const s2=pptx.addSlide(); addTitle(s2,"Screens"); addSub(s2,`${CS.screensNew} created, ${CS.screens-CS.screensNew} edited${CS.screens>items.length?` (first ${items.length} shown)`:""}`);
+        [items.slice(0,half),items.slice(half)].forEach((col,i)=>{ if(col.length) s2.addText(col.map(t=>({text:t,options:{bullet:true,breakLine:true}})),{x:0.4+i*6.2,y:1.2,w:6,h:5.4,fontSize:11,color:DARK,fontFace:"Calibri",valign:"top"}); });
+      }
+    }
   }
 
   // Slide 5 — Findings (up to 6, two per slide)
